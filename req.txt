@@ -1,0 +1,7 @@
+Flask
+opencv-python
+face_recognition
+firebase-admin
+cmake 
+boost
+dlib
