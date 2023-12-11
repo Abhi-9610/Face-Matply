@@ -4,8 +4,9 @@ import face_recognition
 import firebase_admin
 from firebase_admin import credentials, storage, db
 import os
-import uuid
 from flask import Flask, request, jsonify
+import base64
+import numpy as np
 
 ALLOWED_EXTENSIONS = {'jpg', 'png', 'jpeg'}
 app = Flask(__name__)
@@ -27,7 +28,6 @@ def is_registered(face_encoding):
     for key, value in registered_faces.items():
         registered_face_encoding = value.get('encoding')
 
-        # Check if either of the face encodings is None
         if registered_face_encoding is None or face_encoding is None:
             continue
 
@@ -37,117 +37,101 @@ def is_registered(face_encoding):
 
     return None
 
+def decode_base64_image(base64_string):
+    encoded_data = base64_string.split(',')[1]
+    nparr = np.frombuffer(base64.b64decode(encoded_data), np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    return img
+
+def save_base64_image(base64_string, local_image_path):
+    encoded_data = base64_string.split(',')[1]
+    with open(local_image_path, 'wb') as f:
+        f.write(base64.b64decode(encoded_data))
 
 @app.route('/home')
 def home():
     return "home"
 
-@app.route('/check_face/<image_path>', methods=['POST'])
-def check_face(image_path):
-    raw_image_path = os.path.join('images', image_path)
+@app.route('/check-face', methods=['POST'])
+def check_or_register_face():
+    try:
+        # Retrieve data from the form
+        base64_image = request.form.get('base64_image')
+        name = request.form.get('name')
+        age = request.form.get('age')
+        if len(base64_image) > MAX_BASE64_LENGTH:
+            return jsonify({'status': False, 'details': f"Base64 image length exceeds the allowed limit of {MAX_BASE64_LENGTH} bytes"}), 400
+        if not base64_image:
+            return jsonify({'status': False, 'details': "Please provide a base64-encoded image in the 'base64_image' field"}), 400
 
-    if allowed_file(raw_image_path):
-        try:
-            raw_picture = face_recognition.load_image_file(raw_image_path)
-            raw_picture_rgb = cv2.cvtColor(raw_picture, cv2.COLOR_BGR2RGB)
+        raw_picture = decode_base64_image(base64_image)
+        raw_picture_rgb = cv2.cvtColor(raw_picture, cv2.COLOR_BGR2RGB)
+        face_encodings = face_recognition.face_encodings(raw_picture_rgb)
 
-            face_encodings = face_recognition.face_encodings(raw_picture_rgb)
+        if face_encodings and len(face_encodings) > 0:
+            raw_face_encoding = face_encodings[0]
+            registered_id = is_registered(raw_face_encoding)
 
-         
-            if face_encodings and len(face_encodings) > 0:
-                raw_face_encoding = face_encodings[0]
-
-                registered_id = is_registered(raw_face_encoding)
+            if registered_id:
                 user_details = ref.child(registered_id).get()
-
-                if user_details:
-                    user_name = user_details.get('name', 'User')
-                    return jsonify({
-                        'status': True,
-                        'details': f"Welcome, {user_name}! You are registered with ID: {registered_id}"
-                    }), 200
-                else:
-                    return jsonify({
-                        'status': False,
-                        'details': "You are not registered!!"
-                    }), 404
-            else:
+                user_name = user_details.get('name', 'User')
                 return jsonify({
-                    'status': False,
-                    'details': "No face found in the provided image"
-                }), 404
+                    'status': True,
+                    "message": "Welcome!!",
+                    "name": user_name,
+                    "registred_id": registered_id
+                }), 200
+            else:
+                if not name or not age:
+                    return jsonify({'status': False, 'details': "You are not Registred!!! Please Provide Name and Age"}), 400
 
-        except Exception as e:
+                local_image_path = os.path.join('images', f"{name.lower().replace(' ', '_')}_{age}.jpg")
+                save_base64_image(base64_image, local_image_path)
+
+                image = face_recognition.load_image_file(local_image_path)
+                face_encodings = face_recognition.face_encodings(image)
+
+                if not face_encodings:
+                    return jsonify({'status': False, 'details': "No face found in the provided image"}), 400
+
+                encodings_directory = os.path.join('encodings')
+                os.makedirs(encodings_directory, exist_ok=True)
+
+                firebase_safe_filename = os.path.basename(local_image_path).replace('.', '_')
+                encodings_file_path = os.path.join(encodings_directory, f'{firebase_safe_filename}_encodings.p')
+                with open(encodings_file_path, 'wb') as encodings_file:
+                    pickle.dump(face_encodings, encodings_file)
+
+                storage_image_path = f"images/{firebase_safe_filename}"
+                storage_blob = bucket.blob(storage_image_path)
+                storage_blob.upload_from_filename(local_image_path)
+
+                new_registration = {
+                    'name': name,
+                    'age': age,
+                    'encoding': face_encodings[0].tolist(),
+                    'image_path': storage_image_path,
+                    'encodings_file_path': encodings_file_path
+                }
+
+                ref.child(firebase_safe_filename).set(new_registration)
+
+                print("Location of the stored base64 image:", local_image_path)
+
+                return jsonify({'status': True,
+                                'details': f"Registration successful! Your unique filename is: {firebase_safe_filename}"}), 201
+
+        else:
             return jsonify({
                 'status': False,
-                'details': f"Error processing image: {str(e)}"
-            }), 500
-    else:
+                'details': "No face found in the provided image"
+            }), 404
+
+    except Exception as e:
         return jsonify({
             'status': False,
-            'details': "Invalid image format"
-        }), 400
+            'details': f"Error processing image: {str(e)}"
+        }), 500
 
-
-@app.route('/registration', methods=['POST'])
-def registration():
-    uploaded_file = request.files.get('image', None)
-    name = request.form.get('name')
-    age = request.form.get('age')
-
-    if not uploaded_file:
-        return jsonify({'status': False, 'details': "Please provide an image"}), 400
-
-    if not name:
-        return jsonify({'status': False, 'details': "Please provide a name"}), 400
-
-    if not age:
-        return jsonify({'status': False, 'details': "Please provide an age"}), 400
-
-    if allowed_file(uploaded_file.filename):
-   
-        filename_prefix = f"{name.lower().replace(' ', '_')}_{age}"
-        unique_filename = f"{filename_prefix}_{uuid.uuid4().hex[:8]}.jpg"
-
-      
-        firebase_safe_filename = unique_filename.replace('.', '_')
-
-        local_image_path = os.path.join('images', unique_filename)
-        uploaded_file.save(local_image_path)
-
-   
-        image = face_recognition.load_image_file(local_image_path)
-        face_encodings = face_recognition.face_encodings(image)
-
-        if not face_encodings:
-            return jsonify({'status': False, 'details': "No face found in the provided image"}), 400
-
-   
-        encodings_directory = os.path.join('encodings')
-        os.makedirs(encodings_directory, exist_ok=True)
-
-    
-        encodings_file_path = os.path.join(encodings_directory, f'{firebase_safe_filename}_encodings.p')
-        with open(encodings_file_path, 'wb') as encodings_file:
-            pickle.dump(face_encodings, encodings_file)
-
-        storage_image_path = f"images/{firebase_safe_filename}"
-        storage_blob = bucket.blob(storage_image_path)
-        storage_blob.upload_from_filename(local_image_path)
-
-        new_registration = {
-            'name': name,
-            'age': age,
-            'encoding': face_encodings[0].tolist(),  # Save only the first face encoding
-            'image_path': storage_image_path,
-            'encodings_file_path': encodings_file_path
-        }
-
-      
-        ref.child(firebase_safe_filename).set(new_registration)
-
-        return jsonify({'status': True, "details": f"Registration successful! Your unique filename is: {unique_filename}"}), 201
-    else:
-        return jsonify({'status': False, 'details': "Invalid image format or no image provided"}), 400
 if __name__ == '__main__':
     app.run(debug=True)
